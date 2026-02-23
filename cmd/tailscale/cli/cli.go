@@ -259,6 +259,7 @@ change in the future.
 			pingCmd,
 			ncCmd,
 			sshCmd,
+			rshCmd,
 			nilOrCall(maybeFunnelCmd),
 			nilOrCall(maybeServeCmd),
 			versionCmd,

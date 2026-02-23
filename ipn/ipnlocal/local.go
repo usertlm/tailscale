@@ -653,6 +653,13 @@ func (b *LocalBackend) onAppConnectorStoreRoutes(ri appctype.RouteInfo) {
 func (b *LocalBackend) Clock() tstime.Clock { return b.clock }
 func (b *LocalBackend) Sys() *tsd.System    { return b.sys }
 
+// PeerAPIBase returns the "http://ip:port" URL base to reach a peer's PeerAPI.
+// It returns the empty string if the peer doesn't support PeerAPI or there's
+// no matching address family.
+func (b *LocalBackend) PeerAPIBase(peer tailcfg.NodeView) string {
+	return peerAPIBase(b.NetMap(), peer)
+}
+
 // NodeBackend returns the current node's NodeBackend interface.
 func (b *LocalBackend) NodeBackend() ipnext.NodeBackend {
 	return b.currentNode()
