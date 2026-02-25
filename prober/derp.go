@@ -17,6 +17,7 @@ import (
 	"io"
 	"log"
 	"maps"
+	"math"
 	"net"
 	"net/http"
 	"net/netip"
@@ -423,25 +424,27 @@ func runDerpProbeQueuingDelayContinously(ctx context.Context, from, to *tailcfg.
 	// for packets up to their timeout. As records age out of the front of this
 	// list, if the associated packet arrives, we won't have a txRecord for it
 	// and will consider it to have timed out.
-	txRecords := make([]txRecord, 0, packetsPerSecond*int(packetTimeout.Seconds()))
+	// Use math.Ceil to handle fractional-second timeouts correctly, and add 1
+	// slot of headroom so the buffer is never exactly at theoretical capacity.
+	txRecords := make([]txRecord, 0, packetsPerSecond*int(math.Ceil(packetTimeout.Seconds()))+1)
 	var txRecordsMu sync.Mutex
 
-	// applyTimeouts walks over txRecords and expires any records that are older
-	// than packetTimeout, recording in metrics that they were removed.
+	// applyTimeouts expires records from the front of txRecords that are at or
+	// beyond packetTimeout, recording in metrics that they were dropped.
+	// txRecords is insertion-ordered (oldest first), so only the contiguous
+	// leading prefix of expired records needs to be examined. This makes the
+	// common case (few or no timeouts) O(1) rather than O(n).
 	applyTimeouts := func() {
 		txRecordsMu.Lock()
 		defer txRecordsMu.Unlock()
 
 		now := time.Now()
-		recs := txRecords[:0]
-		for _, r := range txRecords {
-			if now.Sub(r.at) > packetTimeout {
-				packetsDropped.Add(1)
-			} else {
-				recs = append(recs, r)
-			}
+		i := 0
+		for i < len(txRecords) && now.Sub(txRecords[i].at) >= packetTimeout {
+			packetsDropped.Add(1)
+			i++
 		}
-		txRecords = recs
+		txRecords = slices.Delete(txRecords, 0, i)
 	}
 
 	// Send the packets.
@@ -459,6 +462,7 @@ func runDerpProbeQueuingDelayContinously(ctx context.Context, from, to *tailcfg.
 
 		toDERPPubKey := toc.SelfPublicKey()
 		seq := uint64(0)
+		var lastOverflowLog time.Time
 		for {
 			select {
 			case <-ctx.Done():
@@ -467,9 +471,16 @@ func runDerpProbeQueuingDelayContinously(ctx context.Context, from, to *tailcfg.
 				applyTimeouts()
 				txRecordsMu.Lock()
 				if len(txRecords) == cap(txRecords) {
+					// This should be rare with correct capacity sizing, but can
+					// occur when the DERP server is under high load and packets
+					// are accumulating faster than they time out. Evict the
+					// oldest record and count it as dropped.
 					txRecords = slices.Delete(txRecords, 0, 1)
 					packetsDropped.Add(1)
-					log.Printf("unexpected: overflow in txRecords")
+					if time.Since(lastOverflowLog) > (time.Second * 15) {
+						log.Printf("txRecords overflow: DERP server may be under high load (queuing delays exceed timeout)")
+						lastOverflowLog = time.Now()
+					}
 				}
 				txRecords = append(txRecords, txRecord{time.Now(), seq})
 				txRecordsMu.Unlock()
