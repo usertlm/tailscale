@@ -407,6 +407,91 @@ func derpProbeQueuingDelay(ctx context.Context, dm *tailcfg.DERPMap, from, to *t
 	return nil
 }
 
+// qdTracker tracks transmission records for queuing delay measurement.
+// It maintains a sorted slice of transmission times indexed by sequence number.
+type qdTracker struct {
+	mu      sync.Mutex
+	records []qdTxRecord
+	timeout time.Duration
+}
+
+type qdTxRecord struct {
+	at  time.Time
+	seq uint64
+}
+
+// newQDTracker creates a new queuing delay tracker.
+func newQDTracker(packetsPerSecond int, packetTimeout time.Duration) *qdTracker {
+	// Size the buffer to hold enough transmission records to keep timings
+	// for packets up to their timeout. Use math.Ceil to handle fractional-second
+	// timeouts correctly, and add 1 slot of headroom so the buffer is never
+	// exactly at theoretical capacity.
+	cap := int(math.Ceil(float64(packetsPerSecond)*packetTimeout.Seconds())) + 1
+	return &qdTracker{
+		records: make([]qdTxRecord, 0, cap),
+		timeout: packetTimeout,
+	}
+}
+
+// add records a packet transmission. Returns true if the buffer was full
+// and the oldest record was evicted, or false if the record was added normally.
+func (t *qdTracker) add(seq uint64, now time.Time) (overflowed bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if len(t.records) == cap(t.records) {
+		// Buffer is full. This can occur when the DERP server is under high
+		// load and packets are significantly delayed (but not yet past timeout).
+		// Evict the oldest record.
+		t.records = slices.Delete(t.records, 0, 1)
+		overflowed = true
+	}
+	t.records = append(t.records, qdTxRecord{at: now, seq: seq})
+	return overflowed
+}
+
+// applyTimeouts removes records that have exceeded the timeout duration.
+// Returns the number of records that timed out.
+func (t *qdTracker) applyTimeouts(now time.Time) int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	// Records are insertion-ordered (oldest first), so only the contiguous
+	// leading prefix of expired records needs to be examined. This makes the
+	// common case (few or no timeouts) O(1) rather than O(n).
+	i := 0
+	for i < len(t.records) && now.Sub(t.records[i].at) >= t.timeout {
+		i++
+	}
+	if i > 0 {
+		t.records = slices.Delete(t.records, 0, i)
+	}
+	return i
+}
+
+// findAndRemove searches for a record with the given sequence number and removes it.
+// Returns the transmission time if found, or zero time if not found.
+func (t *qdTracker) findAndRemove(seq uint64) (sentAt time.Time, found bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	for i, record := range t.records {
+		switch {
+		case record.seq == seq:
+			sentAt = record.at
+			t.records = slices.Delete(t.records, i, i+1)
+			return sentAt, true
+		case record.seq > seq:
+			// No sent time found, probably a late arrival already
+			// recorded as timeout and removed.
+			return time.Time{}, false
+		case record.seq < seq:
+			continue
+		}
+	}
+	return time.Time{}, false
+}
+
 func runDerpProbeQueuingDelayContinously(ctx context.Context, from, to *tailcfg.DERPNode, fromc, toc *derphttp.Client, packetsPerSecond int, packetTimeout time.Duration, packetsDropped *expvar.Float, qdh *histogram) error {
 	// Make sure all goroutines have finished.
 	var wg sync.WaitGroup
@@ -416,36 +501,7 @@ func runDerpProbeQueuingDelayContinously(ctx context.Context, from, to *tailcfg.
 	defer fromc.Close()
 	defer toc.Close()
 
-	type txRecord struct {
-		at  time.Time
-		seq uint64
-	}
-	// txRecords is sized to hold enough transmission records to keep timings
-	// for packets up to their timeout. As records age out of the front of this
-	// list, if the associated packet arrives, we won't have a txRecord for it
-	// and will consider it to have timed out.
-	// Use math.Ceil to handle fractional-second timeouts correctly, and add 1
-	// slot of headroom so the buffer is never exactly at theoretical capacity.
-	txRecords := make([]txRecord, 0, packetsPerSecond*int(math.Ceil(packetTimeout.Seconds()))+1)
-	var txRecordsMu sync.Mutex
-
-	// applyTimeouts expires records from the front of txRecords that are at or
-	// beyond packetTimeout, recording in metrics that they were dropped.
-	// txRecords is insertion-ordered (oldest first), so only the contiguous
-	// leading prefix of expired records needs to be examined. This makes the
-	// common case (few or no timeouts) O(1) rather than O(n).
-	applyTimeouts := func() {
-		txRecordsMu.Lock()
-		defer txRecordsMu.Unlock()
-
-		now := time.Now()
-		i := 0
-		for i < len(txRecords) && now.Sub(txRecords[i].at) >= packetTimeout {
-			packetsDropped.Add(1)
-			i++
-		}
-		txRecords = slices.Delete(txRecords, 0, i)
-	}
+	tracker := newQDTracker(packetsPerSecond, packetTimeout)
 
 	// Send the packets.
 	sendErrC := make(chan error, 1)
@@ -468,22 +524,19 @@ func runDerpProbeQueuingDelayContinously(ctx context.Context, from, to *tailcfg.
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				applyTimeouts()
-				txRecordsMu.Lock()
-				if len(txRecords) == cap(txRecords) {
-					// This should be rare with correct capacity sizing, but can
-					// occur when the DERP server is under high load and packets
-					// are accumulating faster than they time out. Evict the
-					// oldest record and count it as dropped.
-					txRecords = slices.Delete(txRecords, 0, 1)
+				now := time.Now()
+				dropped := tracker.applyTimeouts(now)
+				packetsDropped.Add(float64(dropped))
+
+				if overflowed := tracker.add(seq, now); overflowed {
+					// Buffer overflowed even after removing timeouts.
 					packetsDropped.Add(1)
 					if time.Since(lastOverflowLog) > (time.Second * 15) {
 						log.Printf("txRecords overflow: DERP server may be under high load (queuing delays exceed timeout)")
 						lastOverflowLog = time.Now()
 					}
 				}
-				txRecords = append(txRecords, txRecord{time.Now(), seq})
-				txRecordsMu.Unlock()
+
 				binary.BigEndian.PutUint64(pkt, seq)
 				seq++
 				if err := fromc.Send(toDERPPubKey, pkt); err != nil {
@@ -515,24 +568,11 @@ func runDerpProbeQueuingDelayContinously(ctx context.Context, from, to *tailcfg.
 					return
 				}
 				seq := binary.BigEndian.Uint64(v.Data)
-				txRecordsMu.Lock()
-			findTxRecord:
-				for i, record := range txRecords {
-					switch {
-					case record.seq == seq:
-						rtt := now.Sub(record.at)
-						qdh.add(rtt.Seconds())
-						txRecords = slices.Delete(txRecords, i, i+1)
-						break findTxRecord
-					case record.seq > seq:
-						// No sent time found, probably a late arrival already
-						// recorded as drop by sender when deleted.
-						break findTxRecord
-					case record.seq < seq:
-						continue
-					}
+				if sentAt, found := tracker.findAndRemove(seq); found {
+					rtt := now.Sub(sentAt)
+					qdh.add(rtt.Seconds())
 				}
-				txRecordsMu.Unlock()
+				// If not found, packet arrived late (already timed out and removed).
 
 			case derp.KeepAliveMessage:
 				// Silently ignore.
