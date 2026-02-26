@@ -521,6 +521,15 @@ type NetfilterRunner interface {
 	// using conntrack.
 	DelStatefulRule(tunname string) error
 
+	// AddConnmarkSaveRule adds conntrack marking rules to save marks from packets.
+	// These rules run in mangle/PREROUTING and mangle/OUTPUT to mark connections
+	// and restore marks on reply packets before rp_filter checks, enabling proper
+	// routing table lookups for exit nodes and subnet routers.
+	AddConnmarkSaveRule() error
+
+	// DelConnmarkSaveRule removes conntrack marking rules added by AddConnmarkSaveRule.
+	DelConnmarkSaveRule() error
+
 	// HasIPV6 reports true if the system supports IPv6.
 	HasIPV6() bool
 
@@ -1947,6 +1956,223 @@ func (n *nftablesRunner) DelStatefulRule(tunname string) error {
 	if err := conn.Flush(); err != nil {
 		return fmt.Errorf("flush del stateful rule: %w", err)
 	}
+	return nil
+}
+
+// makeConnmarkRestoreExprs creates nftables expressions to restore mark from conntrack.
+// Implements: ct state established,related ct mark & 0xff0000 != 0 meta mark set ct mark & 0xff0000
+func makeConnmarkRestoreExprs() []expr.Any {
+	return []expr.Any{
+		// Load conntrack state into register 1
+		&expr.Ct{
+			Register: 1,
+			Key:      expr.CtKeySTATE,
+		},
+		// Check if state is ESTABLISHED or RELATED
+		&expr.Bitwise{
+			SourceRegister: 1,
+			DestRegister:   1,
+			Len:            4,
+			Mask: nativeUint32(
+				expr.CtStateBitESTABLISHED |
+					expr.CtStateBitRELATED),
+			Xor: nativeUint32(0),
+		},
+		&expr.Cmp{
+			Op:       expr.CmpOpNeq,
+			Register: 1,
+			Data:     []byte{0, 0, 0, 0},
+		},
+		// Load conntrack mark into register 1
+		&expr.Ct{
+			Register: 1,
+			Key:      expr.CtKeyMARK,
+		},
+		// Mask to Tailscale mark bits (0xff0000)
+		&expr.Bitwise{
+			SourceRegister: 1,
+			DestRegister:   1,
+			Len:            4,
+			Mask:           getTailscaleFwmarkMask(),
+			Xor:            []byte{0x00, 0x00, 0x00, 0x00},
+		},
+		// Set packet mark from register 1
+		&expr.Meta{
+			Key:            expr.MetaKeyMARK,
+			SourceRegister: true,
+			Register:       1,
+		},
+	}
+}
+
+// makeConnmarkSaveExprs creates nftables expressions to save mark to conntrack.
+// Implements: ct state new meta mark & 0xff0000 != 0 ct mark set meta mark & 0xff0000
+func makeConnmarkSaveExprs() []expr.Any {
+	return []expr.Any{
+		// Load conntrack state into register 1
+		&expr.Ct{
+			Register: 1,
+			Key:      expr.CtKeySTATE,
+		},
+		// Check if state is NEW
+		&expr.Bitwise{
+			SourceRegister: 1,
+			DestRegister:   1,
+			Len:            4,
+			Mask:           nativeUint32(expr.CtStateBitNEW),
+			Xor:            nativeUint32(0),
+		},
+		&expr.Cmp{
+			Op:       expr.CmpOpNeq,
+			Register: 1,
+			Data:     []byte{0, 0, 0, 0},
+		},
+		// Load packet mark into register 1
+		&expr.Meta{
+			Key:      expr.MetaKeyMARK,
+			Register: 1,
+		},
+		// Mask to Tailscale mark bits (0xff0000)
+		&expr.Bitwise{
+			SourceRegister: 1,
+			DestRegister:   1,
+			Len:            4,
+			Mask:           getTailscaleFwmarkMask(),
+			Xor:            []byte{0x00, 0x00, 0x00, 0x00},
+		},
+		// Check if mark is non-zero
+		&expr.Cmp{
+			Op:       expr.CmpOpNeq,
+			Register: 1,
+			Data:     []byte{0, 0, 0, 0},
+		},
+		// Load packet mark again for saving
+		&expr.Meta{
+			Key:      expr.MetaKeyMARK,
+			Register: 1,
+		},
+		// Mask again
+		&expr.Bitwise{
+			SourceRegister: 1,
+			DestRegister:   1,
+			Len:            4,
+			Mask:           getTailscaleFwmarkMask(),
+			Xor:            []byte{0x00, 0x00, 0x00, 0x00},
+		},
+		// Set conntrack mark from register 1
+		&expr.Ct{
+			Key:            expr.CtKeyMARK,
+			SourceRegister: true,
+			Register:       1,
+		},
+	}
+}
+
+// AddConnmarkSaveRule adds conntrack marking rules to save marks from packets.
+// These rules run in mangle/PREROUTING and mangle/OUTPUT to mark connections
+// and restore marks on reply packets before rp_filter checks, enabling proper
+// routing table lookups for exit nodes and subnet routers.
+func (n *nftablesRunner) AddConnmarkSaveRule() error {
+	conn := n.conn
+
+	// Add rules for both IPv4 and IPv6
+	for _, table := range n.getTables() {
+		// Get or create mangle table
+		mangleTable := &nftables.Table{
+			Family: table.Filter.Family,
+			Name:   "mangle",
+		}
+
+		// Get PREROUTING chain
+		preroutingChain, err := getChainFromTable(conn, mangleTable, "PREROUTING")
+		if err != nil {
+			// Chain might not exist, try to create it
+			preroutingChain = &nftables.Chain{
+				Name:     "PREROUTING",
+				Table:    mangleTable,
+				Type:     nftables.ChainTypeFilter,
+				Hooknum:  nftables.ChainHookPrerouting,
+				Priority: nftables.ChainPriorityMangle,
+			}
+		}
+
+		// Add PREROUTING rule to restore mark from conntrack
+		conn.InsertRule(&nftables.Rule{
+			Table:    mangleTable,
+			Chain:    preroutingChain,
+			Position: 0,
+			Exprs:    makeConnmarkRestoreExprs(),
+		})
+
+		// Get OUTPUT chain
+		outputChain, err := getChainFromTable(conn, mangleTable, "OUTPUT")
+		if err != nil {
+			// Chain might not exist, try to create it
+			outputChain = &nftables.Chain{
+				Name:     "OUTPUT",
+				Table:    mangleTable,
+				Type:     nftables.ChainTypeRoute,
+				Hooknum:  nftables.ChainHookOutput,
+				Priority: nftables.ChainPriorityMangle,
+			}
+		}
+
+		// Add OUTPUT rule to save mark to conntrack
+		conn.InsertRule(&nftables.Rule{
+			Table:    mangleTable,
+			Chain:    outputChain,
+			Position: 0,
+			Exprs:    makeConnmarkSaveExprs(),
+		})
+	}
+
+	if err := conn.Flush(); err != nil {
+		return fmt.Errorf("flush add connmark rules: %w", err)
+	}
+
+	return nil
+}
+
+// DelConnmarkSaveRule removes conntrack marking rules added by AddConnmarkSaveRule.
+func (n *nftablesRunner) DelConnmarkSaveRule() error {
+	conn := n.conn
+
+	for _, table := range n.getTables() {
+		mangleTable := &nftables.Table{
+			Family: table.Filter.Family,
+			Name:   "mangle",
+		}
+
+		// Remove PREROUTING rule
+		preroutingChain, err := getChainFromTable(conn, mangleTable, "PREROUTING")
+		if err == nil {
+			rule, err := findRule(conn, &nftables.Rule{
+				Table: mangleTable,
+				Chain: preroutingChain,
+				Exprs: makeConnmarkRestoreExprs(),
+			})
+			if err == nil && rule != nil {
+				conn.DelRule(rule)
+			}
+		}
+
+		// Remove OUTPUT rule
+		outputChain, err := getChainFromTable(conn, mangleTable, "OUTPUT")
+		if err == nil {
+			rule, err := findRule(conn, &nftables.Rule{
+				Table: mangleTable,
+				Chain: outputChain,
+				Exprs: makeConnmarkSaveExprs(),
+			})
+			if err == nil && rule != nil {
+				conn.DelRule(rule)
+			}
+		}
+	}
+
+	// Ignore errors during deletion - rules might not exist
+	conn.Flush()
+
 	return nil
 }
 

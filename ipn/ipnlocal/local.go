@@ -5637,6 +5637,12 @@ func (b *LocalBackend) routerConfigLocked(cfg *wgcfg.Config, prefs ipn.PrefsView
 		}
 	}
 
+	// Enable connmark for rp_filter workaround when acting as exit node or subnet router.
+	// This is needed on Linux systems with strict reverse path filtering (rp_filter=1).
+	if runtime.GOOS == "linux" && len(rs.SubnetRoutes) > 0 {
+		rs.UseConnmarkForRPFilter = true
+	}
+
 	return rs
 }
 

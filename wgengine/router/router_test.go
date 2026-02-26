@@ -15,7 +15,7 @@ func TestConfigEqual(t *testing.T) {
 	testedFields := []string{
 		"LocalAddrs", "Routes", "LocalRoutes", "NewMTU",
 		"SubnetRoutes", "SNATSubnetRoutes", "StatefulFiltering",
-		"NetfilterMode", "NetfilterKind",
+		"NetfilterMode", "NetfilterKind", "UseConnmarkForRPFilter",
 	}
 	configType := reflect.TypeFor[Config]()
 	configFields := []string{}
@@ -146,6 +146,16 @@ func TestConfigEqual(t *testing.T) {
 			&Config{NewMTU: 1280},
 			&Config{NewMTU: 0},
 			false,
+		},
+		{
+			&Config{UseConnmarkForRPFilter: false},
+			&Config{UseConnmarkForRPFilter: true},
+			false,
+		},
+		{
+			&Config{UseConnmarkForRPFilter: true},
+			&Config{UseConnmarkForRPFilter: true},
+			true,
 		},
 	}
 	for i, tt := range tests {

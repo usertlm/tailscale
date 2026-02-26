@@ -527,6 +527,79 @@ func (i *iptablesRunner) DelStatefulRule(tunname string) error {
 	return nil
 }
 
+// AddConnmarkSaveRule adds conntrack marking rules to save marks from packets.
+// These rules run in mangle/PREROUTING and mangle/OUTPUT to mark connections
+// and restore marks on reply packets before rp_filter checks, enabling proper
+// routing table lookups for exit nodes and subnet routers.
+func (i *iptablesRunner) AddConnmarkSaveRule() error {
+	// mangle/PREROUTING: Restore mark from conntrack for ESTABLISHED/RELATED connections
+	// This runs BEFORE routing decision and rp_filter check
+	for _, ipt := range []iptablesInterface{i.ipt4, i.ipt6} {
+		args := []string{
+			"-m", "conntrack",
+			"--ctstate", "ESTABLISHED,RELATED",
+			"-j", "CONNMARK",
+			"--restore-mark",
+			"--nfmask", fwmarkMask,
+			"--ctmask", fwmarkMask,
+		}
+		if err := ipt.Insert("mangle", "PREROUTING", 1, args...); err != nil {
+			return fmt.Errorf("adding %v in mangle/PREROUTING: %w", args, err)
+		}
+	}
+
+	// mangle/OUTPUT: Save mark to conntrack for NEW connections with non-zero marks
+	for _, ipt := range []iptablesInterface{i.ipt4, i.ipt6} {
+		args := []string{
+			"-m", "conntrack",
+			"--ctstate", "NEW",
+			"-m", "mark",
+			"!", "--mark", "0x0/" + fwmarkMask,
+			"-j", "CONNMARK",
+			"--save-mark",
+			"--nfmask", fwmarkMask,
+			"--ctmask", fwmarkMask,
+		}
+		if err := ipt.Insert("mangle", "OUTPUT", 1, args...); err != nil {
+			return fmt.Errorf("adding %v in mangle/OUTPUT: %w", args, err)
+		}
+	}
+
+	return nil
+}
+
+// DelConnmarkSaveRule removes conntrack marking rules added by AddConnmarkSaveRule.
+func (i *iptablesRunner) DelConnmarkSaveRule() error {
+	for _, ipt := range []iptablesInterface{i.ipt4, i.ipt6} {
+		// Delete PREROUTING rule
+		args := []string{
+			"-m", "conntrack",
+			"--ctstate", "ESTABLISHED,RELATED",
+			"-j", "CONNMARK",
+			"--restore-mark",
+			"--nfmask", fwmarkMask,
+			"--ctmask", fwmarkMask,
+		}
+		// Ignore error if rule doesn't exist
+		ipt.Delete("mangle", "PREROUTING", args...)
+
+		// Delete OUTPUT rule
+		args = []string{
+			"-m", "conntrack",
+			"--ctstate", "NEW",
+			"-m", "mark",
+			"!", "--mark", "0x0/" + fwmarkMask,
+			"-j", "CONNMARK",
+			"--save-mark",
+			"--nfmask", fwmarkMask,
+			"--ctmask", fwmarkMask,
+		}
+		// Ignore error if rule doesn't exist
+		ipt.Delete("mangle", "OUTPUT", args...)
+	}
+	return nil
+}
+
 // buildMagicsockPortRule generates the string slice containing the arguments
 // to describe a rule accepting traffic on a particular port to iptables. It is
 // separated out here to avoid repetition in AddMagicsockPortRule and

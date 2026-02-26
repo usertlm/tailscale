@@ -80,16 +80,17 @@ type linuxRouter struct {
 	cmd commandRunner
 	nfr linuxfw.NetfilterRunner
 
-	mu                sync.Mutex
-	addrs             map[netip.Prefix]bool
-	routes            map[netip.Prefix]bool
-	localRoutes       map[netip.Prefix]bool
-	snatSubnetRoutes  bool
-	statefulFiltering bool
-	netfilterMode     preftype.NetfilterMode
-	netfilterKind     string
-	magicsockPortV4   uint16
-	magicsockPortV6   uint16
+	mu                  sync.Mutex
+	addrs               map[netip.Prefix]bool
+	routes              map[netip.Prefix]bool
+	localRoutes         map[netip.Prefix]bool
+	snatSubnetRoutes    bool
+	statefulFiltering   bool
+	connmarkEnabled     bool // whether connmark rules are currently enabled
+	netfilterMode       preftype.NetfilterMode
+	netfilterKind       string
+	magicsockPortV4     uint16
+	magicsockPortV6     uint16
 }
 
 func newUserspaceRouter(logf logger.Logf, tunDev tun.Device, netMon *netmon.Monitor, health *health.Tracker, bus *eventbus.Bus) (router.Router, error) {
@@ -478,6 +479,24 @@ func (r *linuxRouter) Set(cfg *router.Config) error {
 	}
 	r.statefulFiltering = cfg.StatefulFiltering
 	r.updateStatefulFilteringWithDockerWarning(cfg)
+
+	// Handle connmark rules for rp_filter compatibility
+	switch {
+	case cfg.UseConnmarkForRPFilter == r.connmarkEnabled:
+		// state already correct, nothing to do.
+	case cfg.UseConnmarkForRPFilter:
+		r.logf("enabling connmark-based rp_filter workaround")
+		if err := r.nfr.AddConnmarkSaveRule(); err != nil {
+			r.logf("warning: failed to add connmark rules (rp_filter workaround may not work): %v", err)
+			errs = append(errs, fmt.Errorf("enabling connmark rules: %w", err))
+		}
+	default:
+		r.logf("disabling connmark-based rp_filter workaround")
+		if err := r.nfr.DelConnmarkSaveRule(); err != nil {
+			r.logf("warning: failed to delete connmark rules: %v", err)
+		}
+	}
+	r.connmarkEnabled = cfg.UseConnmarkForRPFilter
 
 	// Issue 11405: enable IP forwarding on gokrazy.
 	advertisingRoutes := len(cfg.SubnetRoutes) > 0

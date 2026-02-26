@@ -136,6 +136,12 @@ type Config struct {
 	StatefulFiltering bool                   // Apply stateful filtering to inbound connections
 	NetfilterMode     preftype.NetfilterMode // how much to manage netfilter rules
 	NetfilterKind     string                 // what kind of netfilter to use ("nftables", "iptables", or "" to auto-detect)
+
+	// UseConnmarkForRPFilter controls whether conntrack-based marking rules
+	// are added to work around strict rp_filter (rp_filter=1).
+	// When enabled, marks are saved to conntrack and restored on reply packets
+	// before rp_filter checks, allowing proper routing table lookups.
+	UseConnmarkForRPFilter bool
 }
 
 func (a *Config) Equal(b *Config) bool {
