@@ -1001,13 +1001,21 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap, opts *GetRe
 					// We set these IPv4 and IPv6 but they're not really used
 					// and we don't necessarily set them both. If UDP is blocked
 					// and both IPv4 and IPv6 are available over TCP, it's basically
-					// random which fields end up getting set here.
-					// Since they're not needed, that's fine for now.
+					// random which fields end up getting set here, unless we also set
+					// GlobalV4/GlobalV6 for the address.
+					// When UDP is blocked, we use the probed IP as a fallback for
+					// IPv4/IPv6 address detection (for display purposes).
 					if ip.Is4() {
 						rs.report.IPv4 = true
+						if !rs.report.GlobalV4.IsValid() {
+							rs.report.GlobalV4 = netip.AddrPortFrom(ip, 0)
+						}
 					}
 					if ip.Is6() {
 						rs.report.IPv6 = true
+						if !rs.report.GlobalV6.IsValid() {
+							rs.report.GlobalV6 = netip.AddrPortFrom(ip, 0)
+						}
 					}
 					rs.mu.Unlock()
 				}
